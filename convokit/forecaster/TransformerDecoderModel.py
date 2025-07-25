@@ -19,7 +19,7 @@ from .TransformerForecasterConfig import TransformerForecasterConfig
 import shutil
 
 
-def _get_templet_map(model_name_or_path):
+def _get_template_map(model_name_or_path):
     """
     Map a model name or path to its corresponding prompt template family.
 
@@ -84,7 +84,7 @@ class TransformerDecoderModel(ForecasterModel):
 
         self.tokenizer = get_chat_template(
             tokenizer,
-            chat_template=_get_templet_map(model_name_or_path),  # TO-DO: Define this
+            chat_template=_get_template_map(model_name_or_path),
             mapping={"role": "from", "content": "value", "user": "human", "assistant": "model"},
         )
         # Custom prompt
