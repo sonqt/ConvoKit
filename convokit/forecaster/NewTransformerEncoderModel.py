@@ -6,8 +6,6 @@ try:
         AutoConfig,
         AutoModelForSequenceClassification,
         AutoTokenizer,
-        TrainingArguments,
-        Trainer,
     )
 
     TRANSFORMERS_AVAILABLE = True
@@ -17,15 +15,13 @@ except (ModuleNotFoundError, ImportError) as e:
     ) from e
 
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from transformers import get_scheduler
-from math import ceil
 import os
 import pandas as pd
 import numpy as np
 import json
 from tqdm import tqdm
-from sklearn.metrics import roc_curve
+# from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
 import shutil
@@ -127,7 +123,7 @@ class NewTransformerEncoderModel(ForecasterModel):
         )
         return tokenized_context
 
-    def _context_to_bert_data(self, contexts):
+    def _context_to_testing_data(self, contexts):
         """
         Convert context tuples into a HuggingFace Dataset formatted for BERT-family models.
 
@@ -309,10 +305,11 @@ class NewTransformerEncoderModel(ForecasterModel):
         Convert context tuples into a HuggingFace Dataset formatted for training with multiple turns.
 
         This method processes each context tuple by:
-        - Extracting the last k turns of the conversation history associated with the current utterance
+        - Extracting the last k timestamps (with full conversational history/context upto that timestamp) of the conversation
         - Generating a label for the conversation using the provided `self.labeler`
-        - Tokenizing the resulting k contexts
-        - Padding sequences in two dimensions: sequence length and number of turns (k)
+        - Tokenizing the resulting k contexts associated with the k timestamps
+        - Padding sequences in two dimensions: sequence length and number of timestamps (k).
+            Some conversations may have fewer than k timestamps, in which case we pad with copies of the earliest timestamp.
 
         :param contexts: An iterable of context tuples, each containing a current utterance
             and its conversation history.
@@ -329,7 +326,7 @@ class NewTransformerEncoderModel(ForecasterModel):
             convo = context.current_utterance.get_conversation()
             label = self.labeler(convo)
 
-            # Generate k contexts
+            # Generate k timestamps/contexts
             context_utts = [context.context[:max(1, len(context.context) + i)] for i in range(-k+1, 1)]
             tokenized_contexts = [self._tokenize(utt) for utt in context_utts]
 
@@ -352,7 +349,7 @@ class NewTransformerEncoderModel(ForecasterModel):
         # Defaults (best-practice fallbacks if missing in config)
         # ----------------------------
         cfg = self.config
-        k = 8
+        k = getattr(cfg, "conversation_training_length", 8)
         accum_steps = getattr(cfg, "gradient_accumulation_steps", 4)
         per_device_batch_size = getattr(cfg, "per_device_batch_size", 1)
         weight_decay = getattr(cfg, "weight_decay", 0.01)
@@ -367,7 +364,7 @@ class NewTransformerEncoderModel(ForecasterModel):
         # ----------------------------
         val_contexts = list(val_contexts)
         train_ds = self._context_to_training_data(contexts, k)
-        val_ds = self._context_to_bert_data(val_contexts)
+        val_ds = self._context_to_testing_data(val_contexts)
         dataset = DatasetDict({"train": train_ds, "val_for_tuning": val_ds})
         dataset.set_format("torch")
 
@@ -488,10 +485,12 @@ class NewTransformerEncoderModel(ForecasterModel):
 
     def compute_loss(self, logits, labels, epoch):
         """
-        Consistency training over k turns:
+        New training loss over k utterances:
         - Supervise the *last* turn with the gold label (standard CE).
         - For turns 0..k-2, add a consistency loss that makes logits[t]
             match the soft targets from logits[t+1] (teacher).
+        - Additionally, add a loss that makes the turn with the highest
+            positive logit match the gold label.
 
         Args:
             logits: Tensor of shape (k, 2) with raw (pre-softmax) scores.
@@ -517,8 +516,8 @@ class NewTransformerEncoderModel(ForecasterModel):
         # ----- 3) Highest Logit Loss  -----
         highest_logits = logits[torch.argmax(F.softmax(logits, dim=-1)[:, 1])] # (2,)
         loss_highest = F.cross_entropy(highest_logits.unsqueeze(0), labels.unsqueeze(0))
-        # Weighting: mirror the previous emphasis on the second term
-        return 1/(1+epoch) * (loss_last + loss_highest*epoch)  # Average the losses
+
+        return 1/(1+epoch) * (loss_last + loss_highest*epoch)  # Scheduling to reduce the focus on last-turn CE over time
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """
@@ -530,7 +529,7 @@ class NewTransformerEncoderModel(ForecasterModel):
 
         :return: a Pandas DataFrame, with one row for each context, indexed by the ID of that context's current utterance. Contains two columns, one with raw probabilities named according to forecast_prob_attribute_name, and one with discretized (binary) forecasts named according to forecast_attribute_name
         """
-        test_pairs = self._context_to_bert_data(contexts)
+        test_pairs = self._context_to_testing_data(contexts)
         dataset = DatasetDict({"test": test_pairs})
         dataset.set_format("torch")
         forecasts_df = self._predict(
