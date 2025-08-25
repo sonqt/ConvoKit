@@ -21,6 +21,7 @@ import pandas as pd
 import numpy as np
 import json
 from tqdm import tqdm
+
 # from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
@@ -327,7 +328,9 @@ class NewTransformerEncoderModel(ForecasterModel):
             label = self.labeler(convo)
 
             # Generate k timestamps/contexts
-            context_utts = [context.context[:max(1, len(context.context) + i)] for i in range(-k+1, 1)]
+            context_utts = [
+                context.context[: max(1, len(context.context) + i)] for i in range(-k + 1, 1)
+            ]
             tokenized_contexts = [self._tokenize(utt) for utt in context_utts]
 
             # Pad sequences
@@ -349,6 +352,7 @@ class NewTransformerEncoderModel(ForecasterModel):
         # Defaults (best-practice fallbacks if missing in config)
         # ----------------------------
         cfg = self.config
+        # We only define a few key config parameters (we want to tune) in TransformerForecasterConfig;
         k = getattr(cfg, "conversation_training_length", 8)
         accum_steps = getattr(cfg, "gradient_accumulation_steps", 4)
         per_device_batch_size = getattr(cfg, "per_device_batch_size", 1)
@@ -356,7 +360,9 @@ class NewTransformerEncoderModel(ForecasterModel):
         lr_scheduler_type = getattr(cfg, "lr_scheduler_type", "linear")
         warmup_ratio = getattr(cfg, "warmup_ratio", 0.06)
         max_grad_norm = getattr(cfg, "max_grad_norm", 1.0)
-        num_workers = getattr(cfg, "dataloader_num_workers", min(4, max(1, (os.cpu_count() or 2) // 2)))
+        num_workers = getattr(
+            cfg, "dataloader_num_workers", min(4, max(1, (os.cpu_count() or 2) // 2))
+        )
         pin_memory = True if torch.cuda.is_available() else False
 
         # ----------------------------
@@ -371,7 +377,9 @@ class NewTransformerEncoderModel(ForecasterModel):
         def collate_fn(examples):
             return {
                 "input_ids": torch.stack([torch.as_tensor(ex["input_ids"]) for ex in examples]),
-                "attention_mask": torch.stack([torch.as_tensor(ex["attention_mask"]) for ex in examples]),
+                "attention_mask": torch.stack(
+                    [torch.as_tensor(ex["attention_mask"]) for ex in examples]
+                ),
                 "labels": torch.as_tensor([ex["labels"] for ex in examples]),
                 "id": [ex["id"] for ex in examples],
             }
@@ -389,22 +397,38 @@ class NewTransformerEncoderModel(ForecasterModel):
         # ----------------------------
         # Optimizer (wd hygiene) + Scheduler
         # ----------------------------
-        no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "ln_f.weight", "embeddings.word_embeddings.weight"]
+        no_decay = [
+            "bias",
+            "LayerNorm.weight",
+            "layer_norm.weight",
+            "ln_f.weight",
+            "embeddings.word_embeddings.weight",
+        ]
         param_groups = [
             {
-                "params": [p for n, p in self.model.named_parameters()
-                        if p.requires_grad and not any(nd in n for nd in no_decay)],
+                "params": [
+                    p
+                    for n, p in self.model.named_parameters()
+                    if p.requires_grad and not any(nd in n for nd in no_decay)
+                ],
                 "weight_decay": weight_decay,
             },
             {
-                "params": [p for n, p in self.model.named_parameters()
-                        if p.requires_grad and any(nd in n for nd in no_decay)],
+                "params": [
+                    p
+                    for n, p in self.model.named_parameters()
+                    if p.requires_grad and any(nd in n for nd in no_decay)
+                ],
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = torch.optim.AdamW(param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1e-8)
+        optimizer = torch.optim.AdamW(
+            param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1e-8
+        )
 
-        steps_per_epoch = max(1, len(train_loader) // max(1, accum_steps) + (1 if (len(train_loader) % max(1, accum_steps)) else 0))
+        steps_per_epoch = len(train_loader) // accum_steps + (
+            1 if (len(train_loader) % accum_steps) else 0
+        )
         total_steps = steps_per_epoch * cfg.num_train_epochs
         warmup_steps = int(warmup_ratio * total_steps)
 
@@ -416,7 +440,7 @@ class NewTransformerEncoderModel(ForecasterModel):
         )
 
         # ----------------------------
-        # Training loop (FP32 only)
+        # Training loop
         # ----------------------------
         self.model.train()
         global_step = 0
@@ -427,9 +451,9 @@ class NewTransformerEncoderModel(ForecasterModel):
             optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(train_loader):
-                input_ids = batch["input_ids"].to(cfg.device)           # (B, k, L)
-                attention_mask = batch["attention_mask"].to(cfg.device) # (B, k, L)
-                labels = batch["labels"].to(cfg.device)                 # (B,)
+                input_ids = batch["input_ids"].to(cfg.device)  # (B, k, L)
+                attention_mask = batch["attention_mask"].to(cfg.device)  # (B, k, L)
+                labels = batch["labels"].to(cfg.device)  # (B,)
 
                 B, K, L = input_ids.shape
                 input_ids_flat = input_ids.view(B * K, L)
@@ -441,6 +465,7 @@ class NewTransformerEncoderModel(ForecasterModel):
                 # compute per-example loss and average
                 per_example_losses = []
                 for b in range(B):
+                    # TODO: can be parallelized. Need to rewrite compute_loss to take in batch
                     per_example_losses.append(self.compute_loss(logits[b], labels[b], epoch))
                 batch_loss = torch.stack(per_example_losses).mean() / max(1, accum_steps)
 
@@ -448,7 +473,9 @@ class NewTransformerEncoderModel(ForecasterModel):
                 running_loss += batch_loss.item() * max(1, accum_steps)
 
                 # Step every accumulation boundary
-                is_update_step = ((step + 1) % max(1, accum_steps) == 0) or ((step + 1) == len(train_loader))
+                is_update_step = ((step + 1) % max(1, accum_steps) == 0) or (
+                    (step + 1) == len(train_loader)
+                )
                 if is_update_step:
                     if max_grad_norm is not None and max_grad_norm > 0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
@@ -458,7 +485,9 @@ class NewTransformerEncoderModel(ForecasterModel):
                     scheduler.step()
 
                     global_step += 1
-                    pbar.set_postfix(step=global_step, epoch=epoch + 1, lr=scheduler.get_last_lr()[0])
+                    pbar.set_postfix(
+                        step=global_step, epoch=epoch + 1, lr=scheduler.get_last_lr()[0]
+                    )
                     pbar.update(1)
 
             self.save_model(global_step)
@@ -469,7 +498,6 @@ class NewTransformerEncoderModel(ForecasterModel):
         _ = self._tune_threshold(dataset["val_for_tuning"], val_contexts)
         return
 
-
     def save_model(self, global_step):
         """
         Save the fine-tuned model and tokenizer to the specified output directory.
@@ -479,8 +507,10 @@ class NewTransformerEncoderModel(ForecasterModel):
         """
         output_dir = self.config.output_dir
         step_dir = f"{output_dir}/checkpoint-{global_step}"
-        self.model.save_pretrained(step_dir, safe_serialization=True)     # model.safetensors + config.json
-        self.tokenizer.save_pretrained(step_dir)                          # tokenizer files
+        self.model.save_pretrained(
+            step_dir, safe_serialization=True
+        )  # model.safetensors + config.json
+        self.tokenizer.save_pretrained(step_dir)  # tokenizer files
         return
 
     def compute_loss(self, logits, labels, epoch):
@@ -491,6 +521,7 @@ class NewTransformerEncoderModel(ForecasterModel):
             match the soft targets from logits[t+1] (teacher).
         - Additionally, add a loss that makes the turn with the highest
             positive logit match the gold label.
+        During the first epoch, we only use the last-turn CE loss to stabilize training.
 
         Args:
             logits: Tensor of shape (k, 2) with raw (pre-softmax) scores.
@@ -514,10 +545,12 @@ class NewTransformerEncoderModel(ForecasterModel):
         # else:
         #     consistency_loss = torch.zeros((), device=logits.device)
         # ----- 3) Highest Logit Loss  -----
-        highest_logits = logits[torch.argmax(F.softmax(logits, dim=-1)[:, 1])] # (2,)
+        highest_logits = logits[torch.argmax(F.softmax(logits, dim=-1)[:, 1])]  # (2,)
         loss_highest = F.cross_entropy(highest_logits.unsqueeze(0), labels.unsqueeze(0))
 
-        return 1/(1+epoch) * (loss_last + loss_highest*epoch)  # Scheduling to reduce the focus on last-turn CE over time
+        return (
+            1 / (1 + epoch) * (loss_last + loss_highest * epoch)
+        )  # Scheduling to reduce the focus on last-turn CE over time
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """
