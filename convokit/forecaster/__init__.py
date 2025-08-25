@@ -25,6 +25,7 @@ except ImportError as e:
 
 try:
     from .TransformerEncoderModel import *
+    from .NewTransformerEncoderModel import *
 except ImportError as e:
     if "not currently installed" in str(e):
         print(
